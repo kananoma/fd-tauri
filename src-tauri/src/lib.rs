@@ -10,16 +10,16 @@ use std::time::UNIX_EPOCH;
 pub struct SearchArgs {
     path: String,
     pattern: String,
-    and_pattern: Option<String>, // --and PATTERN
-    extension: Option<String>,   // -e
-    is_glob: bool,               // -g, --glob (false: 正規表現)
-    full_path: bool,             // -p, --full-path
-    hidden: bool,                // -H, --hidden
-    no_ignore: bool,             // -I, --no-ignore
-    unrestricted: bool,          // -u, --unrestricted (-H -I と同義)
-    follow: bool,                // -L, --follow (シンボリックリンク先を追跡)
-    case_sensitive: bool,        // -s
-    file_type: String,           // -t, --type ("all", "file", "directory", "symlink")
+    and_patterns: Vec<String>,
+    extension: Option<String>,
+    is_glob: bool,
+    full_path: bool,
+    hidden: bool,
+    no_ignore: bool,
+    unrestricted: bool,
+    follow: bool,
+    case_sensitive: bool,
+    file_type: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -34,7 +34,6 @@ pub struct SearchResultItem {
     pub is_symlink: bool,
 }
 
-// 正規表現と Glob のどちらでも同一インターフェースでマッチング可能にする Enum
 enum PatternMatcher {
     Regex(Regex),
     Glob(GlobMatcher),
@@ -74,7 +73,7 @@ async fn search_files(args: SearchArgs) -> Result<Vec<SearchResultItem>, String>
 }
 
 fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
-    // 1. パターンマッチャー（基本パターン + --and パターン）の構築
+    // 1. パターンマッチャー（基本パターン + 複数の --and パターン）の構築
     let mut matchers = Vec::new();
     if !args.pattern.trim().is_empty() {
         matchers.push(PatternMatcher::new(
@@ -83,48 +82,46 @@ fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
             args.case_sensitive,
         )?);
     }
-    if let Some(ref and_p) = args.and_pattern {
-        if !and_p.trim().is_empty() {
+
+    // ★ 複数の --and パターンをすべて登録
+    for and_p in &args.and_patterns {
+        let trimmed = and_p.trim();
+        if !trimmed.is_empty() {
             matchers.push(PatternMatcher::new(
-                and_p,
+                trimmed,
                 args.is_glob,
                 args.case_sensitive,
             )?);
         }
     }
 
-    // 2. 拡張子の前処理 (-e)
     let target_ext = args
         .extension
         .as_ref()
         .map(|e| e.trim().trim_start_matches('.').to_string())
         .filter(|e| !e.is_empty());
 
-    // 3. 検索範囲フラグの解決 (-u は -H と -I の両方を有効化)
     let include_hidden = args.hidden || args.unrestricted;
     let ignore_filters = !(args.no_ignore || args.unrestricted);
 
-    // 4. ignore::WalkBuilder の設定
     let mut builder = WalkBuilder::new(&args.path);
     builder
-        .hidden(!include_hidden) // -H, --hidden
-        .ignore(ignore_filters) // -I, --no-ignore (.ignore)
-        .git_ignore(ignore_filters) // -I, --no-ignore (.gitignore)
-        .git_global(ignore_filters) // グローバル gitignore
-        .git_exclude(ignore_filters) // .git/info/exclude
-        .follow_links(args.follow) // -L, --follow
+        .hidden(!include_hidden)
+        .ignore(ignore_filters)
+        .git_ignore(ignore_filters)
+        .git_global(ignore_filters)
+        .git_exclude(ignore_filters)
+        .follow_links(args.follow)
         .parents(ignore_filters);
 
     let mut results = Vec::new();
 
-    // 5. ディレクトリ走査
     for entry_result in builder.build() {
         let entry = match entry_result {
             Ok(e) => e,
             Err(_) => continue,
         };
 
-        // 検索ルートディレクトリ自身（depth 0）は除外
         if entry.depth() == 0 {
             continue;
         }
@@ -134,7 +131,6 @@ fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
         let is_dir = ft.as_ref().map_or(false, |t| t.is_dir());
         let is_file = ft.as_ref().map_or(false, |t| t.is_file());
 
-        // -t, --type による絞り込み
         match args.file_type.as_str() {
             "file" => {
                 if !is_file {
@@ -151,13 +147,12 @@ fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
                     continue;
                 }
             }
-            _ => {} // "all" の場合は制限なし
+            _ => {}
         }
 
         let path = entry.path();
         let file_name = entry.file_name().to_string_lossy();
 
-        // 拡張子フィルタ (-e)
         if let Some(ref ext) = target_ext {
             let file_ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let is_match = if args.case_sensitive {
@@ -170,20 +165,18 @@ fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
             }
         }
 
-        // -p, --full-path に応じて判定対象テキストを切り替え
         let target_text = if args.full_path {
             path.to_string_lossy()
         } else {
             file_name.clone()
         };
 
-        // メインパターンおよび --and パターンの全条件一致（AND）チェック
+        // すべての条件（基本パターン + すべての --and 条件）に一致するか検証
         let all_matched = matchers.iter().all(|m| m.is_match(&target_text));
         if !all_matched {
             continue;
         }
 
-        // メタデータ（サイズ・更新日時）の取得
         let (size, modified) = match entry.metadata() {
             Ok(meta) => {
                 let mtime = meta
@@ -191,7 +184,6 @@ fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
                     .ok()
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                     .map(|d| d.as_millis() as u64);
-                // ディレクトリの場合はサイズを表示しない（0扱い）
                 let len = if is_dir { 0 } else { meta.len() };
                 (len, mtime)
             }

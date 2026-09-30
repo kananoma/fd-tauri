@@ -6,7 +6,7 @@ import { openPath } from '@tauri-apps/plugin-opener'
 type SearchArgs = {
   path: string
   pattern: string
-  andPattern?: string
+  andPatterns: string[] // ★ 変更: 文字列配列
   extension: string
   isGlob: boolean
   fullPath: boolean
@@ -128,7 +128,7 @@ function ResultRow({ item, copied, onCopy, onError }: ResultRowProps) {
 function App() {
   const [path, setPath] = useState('C:\\')
   const [pattern, setPattern] = useState('')
-  const [andPattern, setAndPattern] = useState('')
+  const [andPatterns, setAndPatterns] = useState<string[]>([]) // ★ 複数パターンの state
   const [extension, setExtension] = useState('')
   const [isGlob, setIsGlob] = useState(false)
   const [fullPath, setFullPath] = useState(false)
@@ -146,6 +146,23 @@ function App() {
   const [copiedPath, setCopiedPath] = useState<string | null>(null)
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
+  // --and パターンの追加・変更・削除ハンドラ
+  function handleAddAndPattern() {
+    setAndPatterns((prev) => [...prev, ''])
+  }
+
+  function handleUpdateAndPattern(index: number, value: string) {
+    setAndPatterns((prev) => {
+      const next = [...prev]
+      next[index] = value
+      return next
+    })
+  }
+
+  function handleRemoveAndPattern(index: number) {
+    setAndPatterns((prev) => prev.filter((_, i) => i !== index))
+  }
+
   async function handleSearch(event: FormEvent) {
     event.preventDefault()
     setLoading(true)
@@ -154,7 +171,7 @@ function App() {
     const args: SearchArgs = {
       path,
       pattern,
-      andPattern: andPattern.trim() || undefined,
+      andPatterns: andPatterns.map((p) => p.trim()).filter((p) => p.length > 0),
       extension,
       isGlob,
       fullPath,
@@ -206,8 +223,8 @@ function App() {
       <main className="flex min-h-0 flex-1 flex-col gap-2 p-2">
         <form onSubmit={handleSearch} className="shrink-0 rounded-lg border border-zinc-200 bg-white p-2.5 shadow-sm">
           {/* 1段目: ディレクトリ & 検索パターン */}
-          <div className="grid gap-2 md:grid-cols-4">
-            <label className="flex flex-col gap-1 md:col-span-2">
+          <div className="grid gap-2 md:grid-cols-3">
+            <label className="flex flex-col gap-1 md:col-span-1">
               <span className="text-xs font-semibold text-zinc-700">検索ディレクトリ</span>
               <div className="flex gap-1.5">
                 <input
@@ -226,20 +243,29 @@ function App() {
               </div>
             </label>
 
-            <label className="flex flex-col gap-1">
+            <label className="flex flex-col gap-1 md:col-span-2">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-semibold text-zinc-700">
                   {isGlob ? 'Glob パターン (-g)' : '正規表現パターン'}
                 </span>
-                <label className="flex cursor-pointer items-center gap-1 text-[11px] font-normal text-sky-700">
-                  <input
-                    type="checkbox"
-                    checked={isGlob}
-                    onChange={(e) => setIsGlob(e.currentTarget.checked)}
-                    className="size-3 rounded"
-                  />
-                  Globモード
-                </label>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={handleAddAndPattern}
+                    className="inline-flex items-center gap-1 text-xs font-medium text-sky-600 hover:text-sky-800"
+                  >
+                    ＋ AND条件を追加
+                  </button>
+                  <label className="flex cursor-pointer items-center gap-1 text-[11px] font-normal text-sky-700">
+                    <input
+                      type="checkbox"
+                      checked={isGlob}
+                      onChange={(e) => setIsGlob(e.currentTarget.checked)}
+                      className="size-3 rounded"
+                    />
+                    Globモード
+                  </label>
+                </div>
               </div>
               <input
                 type="text"
@@ -249,18 +275,41 @@ function App() {
                 className="rounded border border-zinc-300 px-2.5 py-1 text-sm outline-none focus:border-sky-500"
               />
             </label>
-
-            <label className="flex flex-col gap-1">
-              <span className="text-xs font-semibold text-zinc-700">追加条件 (--and)</span>
-              <input
-                type="text"
-                value={andPattern}
-                onChange={(e) => setAndPattern(e.currentTarget.value)}
-                placeholder="必須パターン"
-                className="rounded border border-zinc-300 px-2.5 py-1 text-sm outline-none focus:border-sky-500"
-              />
-            </label>
           </div>
+
+          {/* ★ 動的に増える --and 条件の入力欄エリア */}
+          {andPatterns.length > 0 && (
+            <div className="mt-2 rounded-md bg-zinc-50 p-2 border border-zinc-200">
+              <div className="mb-1 text-[11px] font-semibold text-zinc-600">
+                追加の必須パターン (--and) — すべてに一致するファイルを検索
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {andPatterns.map((andPat, index) => (
+                  <div
+                    key={index}
+                    className="flex items-center gap-1 rounded border border-zinc-300 bg-white px-1.5 py-0.5"
+                  >
+                    <span className="text-[10px] font-bold text-zinc-400">AND #{index + 1}</span>
+                    <input
+                      type="text"
+                      value={andPat}
+                      onChange={(e) => handleUpdateAndPattern(index, e.currentTarget.value)}
+                      placeholder="パターンを入力"
+                      className="w-36 text-xs outline-none bg-transparent"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveAndPattern(index)}
+                      className="flex size-4 items-center justify-center rounded-full text-zinc-400 hover:bg-zinc-200 hover:text-red-600 text-xs"
+                      title="条件を削除"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* 2段目: 拡張子 & 種別 & 各種フラグ */}
           <div className="mt-2.5 grid gap-2 md:grid-cols-4 items-end border-t border-zinc-100 pt-2">
@@ -375,7 +424,6 @@ function App() {
           </div>
         )}
 
-        {/* 検索結果テーブル */}
         <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white">
           <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 bg-zinc-50 px-3 py-1.5">
             <h2 className="text-xs font-semibold text-zinc-800">検索結果</h2>
