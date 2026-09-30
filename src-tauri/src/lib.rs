@@ -62,11 +62,39 @@ async fn search_files(args: SearchArgs) -> Result<Vec<String>, String> {
     Ok(results)
 }
 
+#[tauri::command]
+fn open_in_explorer(path: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command as StdCommand;
+
+        // fd / dialog のパスを explorer が解釈できる形式にする。
+        let path = path.trim().replace('/', "\\");
+        let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
+
+        // Command::arg だと Windows の引用符処理で
+        // `/select,"C:\..."` が壊れて既定のエクスプローラーだけが開く。
+        StdCommand::new("explorer.exe")
+            .raw_arg(format!("/select,\"{path}\""))
+            .spawn()
+            .map_err(|e| format!("エクスプローラーを開けませんでした: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("この機能は Windows のみ対応しています".into())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![search_files])
+        .invoke_handler(tauri::generate_handler![search_files, open_in_explorer])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

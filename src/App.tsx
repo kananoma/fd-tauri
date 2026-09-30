@@ -1,5 +1,7 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, MouseEvent, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
+import { openPath } from "@tauri-apps/plugin-opener";
 
 type SearchArgs = {
   path: string;
@@ -7,6 +9,88 @@ type SearchArgs = {
   hidden: boolean;
   caseSensitive: boolean;
 };
+
+function splitDisplayPath(filePath: string): { dir: string; name: string } {
+  const normalized = filePath.replace(/\//g, "\\");
+  const idx = Math.max(normalized.lastIndexOf("\\"), normalized.lastIndexOf("/"));
+  if (idx === -1) {
+    return { dir: "", name: filePath };
+  }
+  return {
+    dir: filePath.slice(0, idx + 1),
+    name: filePath.slice(idx + 1),
+  };
+}
+
+type ResultItemProps = {
+  filePath: string;
+  copied: boolean;
+  onCopy: (filePath: string) => void;
+  onError: (message: string) => void;
+};
+
+function ResultItem({ filePath, copied, onCopy, onError }: ResultItemProps) {
+  const { dir, name } = splitDisplayPath(filePath);
+
+  async function handleOpen() {
+    try {
+      await openPath(filePath);
+    } catch (e) {
+      onError(typeof e === "string" ? e : String(e));
+    }
+  }
+
+  async function handleReveal(event: MouseEvent) {
+    event.stopPropagation();
+    try {
+      await invoke("open_in_explorer", { path: filePath });
+    } catch (e) {
+      onError(typeof e === "string" ? e : String(e));
+    }
+  }
+
+  async function handleCopy(event: MouseEvent) {
+    event.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(filePath);
+      onCopy(filePath);
+    } catch (e) {
+      onError(typeof e === "string" ? e : String(e));
+    }
+  }
+
+  return (
+    <li
+      className="group flex cursor-pointer items-center gap-2 px-2 py-1 transition hover:bg-sky-50"
+      title="ダブルクリックで開く"
+      onDoubleClick={handleOpen}
+    >
+      <div className="min-w-0 flex-1 font-mono text-sm text-zinc-700">
+        {dir ? <span className="break-all text-zinc-500">{dir}</span> : null}
+        <span className="break-all font-bold text-zinc-900">{name}</span>
+      </div>
+
+      <div className="flex shrink-0 items-center gap-1.5 opacity-80 group-hover:opacity-100">
+        <button
+          type="button"
+          onClick={handleReveal}
+          onDoubleClick={(e) => e.stopPropagation()}
+          className="rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs font-medium text-zinc-600 transition hover:border-sky-300 hover:bg-white hover:text-sky-700"
+        >
+          フォルダを開く
+        </button>
+        <button
+          type="button"
+          onClick={handleCopy}
+          onDoubleClick={(e) => e.stopPropagation()}
+          className="min-w-16 rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs font-medium text-zinc-600 transition hover:border-sky-300 hover:bg-white hover:text-sky-700"
+        >
+          {copied ? "コピー完了!" : "コピー"}
+        </button>
+      </div>
+    </li>
+  );
+}
 
 function App() {
   const [path, setPath] = useState("C:\\");
@@ -17,6 +101,8 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
+  const [copiedPath, setCopiedPath] = useState<string | null>(null);
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   async function handleSearch(event: FormEvent) {
     event.preventDefault();
@@ -43,28 +129,62 @@ function App() {
     }
   }
 
-  return (
-    <div className="min-h-screen bg-zinc-50 text-zinc-800">
+  async function handleBrowse() {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: path || undefined,
+        title: "検索ディレクトリを選択",
+      });
+      if (typeof selected === "string") {
+        setPath(selected);
+      }
+    } catch (e) {
+      setError(typeof e === "string" ? e : String(e));
+    }
+  }
 
-      <main className="mx-auto flex max-w-5xl flex-col gap-6 px-6 py-6">
+  function handleCopied(filePath: string) {
+    setCopiedPath(filePath);
+    if (copyTimer.current) {
+      clearTimeout(copyTimer.current);
+    }
+    copyTimer.current = setTimeout(() => {
+      setCopiedPath(null);
+    }, 1500);
+  }
+
+  return (
+    <div className="flex h-screen flex-col bg-zinc-50 text-zinc-800">
+      <main className="flex min-h-0 flex-1 flex-col gap-2 p-2">
         <form
           onSubmit={handleSearch}
-          className="rounded-xl border border-zinc-200 bg-white p-5 shadow-sm"
+          className="shrink-0 rounded-lg border border-zinc-200 bg-white p-2"
         >
-          <div className="grid gap-4 md:grid-cols-2">
-            <label className="flex flex-col gap-1.5">
+          <div className="grid gap-2 md:grid-cols-2">
+            <label className="flex flex-col gap-1">
               <span className="text-sm font-medium text-zinc-700">
                 検索ディレクトリ
               </span>
-              <input
-                type="text"
-                value={path}
-                onChange={(e) => setPath(e.currentTarget.value)}
-                className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
-              />
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={path}
+                  onChange={(e) => setPath(e.currentTarget.value)}
+                  className="min-w-0 flex-1 rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
+                />
+                <button
+                  type="button"
+                  onClick={handleBrowse}
+                  className="shrink-0 rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm font-medium text-zinc-700 transition hover:border-sky-400 hover:bg-sky-50 hover:text-sky-800"
+                >
+                  参照...
+                </button>
+              </div>
             </label>
 
-            <label className="flex flex-col gap-1.5">
+            <label className="flex flex-col gap-1">
               <span className="text-sm font-medium text-zinc-700">
                 検索キーワード
               </span>
@@ -78,8 +198,8 @@ function App() {
             </label>
           </div>
 
-          <div className="mt-4 flex flex-wrap items-center justify-between gap-4">
-            <div className="flex flex-wrap gap-4 text-sm">
+          <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap gap-3 text-sm">
               <label className="inline-flex cursor-pointer items-center gap-2 text-zinc-700">
                 <input
                   type="checkbox"
@@ -113,38 +233,39 @@ function App() {
         {error && (
           <div
             role="alert"
-            className="rounded-xl border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-700"
+            className="rounded-lg border border-red-300 bg-red-50 px-2 py-1.5 text-sm text-red-700"
           >
             {error}
           </div>
         )}
 
-        <section className="overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm">
-          <div className="flex items-center justify-between border-b border-zinc-200 px-4 py-3">
+        <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white">
+          <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 px-2 py-1.5">
             <h2 className="text-sm font-medium text-zinc-800">検索結果</h2>
             <span className="text-sm text-zinc-500">
               {hasSearched ? `${results.length} 件` : "未検索"}
             </span>
           </div>
 
-          <div className="max-h-[55vh] overflow-y-auto">
+          <div className="min-h-0 flex-1 overflow-y-auto">
             {!hasSearched ? (
-              <p className="px-4 py-10 text-center text-sm text-zinc-400">
+              <p className="px-2 py-4 text-center text-sm text-zinc-400">
                 キーワードを入力して検索してください
               </p>
             ) : results.length === 0 ? (
-              <p className="px-4 py-10 text-center text-sm text-zinc-400">
+              <p className="px-2 py-4 text-center text-sm text-zinc-400">
                 該当するファイルはありません
               </p>
             ) : (
               <ul className="divide-y divide-zinc-100">
                 {results.map((item) => (
-                  <li
+                  <ResultItem
                     key={item}
-                    className="px-4 py-2 font-mono text-sm text-zinc-700 transition hover:bg-sky-50"
-                  >
-                    {item}
-                  </li>
+                    filePath={item}
+                    copied={copiedPath === item}
+                    onCopy={handleCopied}
+                    onError={setError}
+                  />
                 ))}
               </ul>
             )}
