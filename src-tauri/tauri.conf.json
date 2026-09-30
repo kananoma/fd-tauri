@@ -12,9 +12,9 @@
   "app": {
     "windows": [
       {
-        "title": "fd-tauri",
-        "width": 800,
-        "height": 600
+        "title": "fd File Search GUI",
+        "width": 920,
+        "height": 720
       }
     ],
     "security": {
