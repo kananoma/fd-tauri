@@ -6,9 +6,16 @@ import { openPath } from '@tauri-apps/plugin-opener'
 type SearchArgs = {
   path: string
   pattern: string
-  extension: string // 追加
+  andPattern?: string
+  extension: string
+  isGlob: boolean
+  fullPath: boolean
   hidden: boolean
+  noIgnore: boolean
+  unrestricted: boolean
+  follow: boolean
   caseSensitive: boolean
+  fileType: string
 }
 
 type SearchResultItem = {
@@ -17,10 +24,12 @@ type SearchResultItem = {
   dir: string
   size: number
   modified: number | null
+  isDir: boolean
+  isSymlink: boolean
 }
 
-// ファイルサイズを読みやすい単位に変換 (B, KB, MB, GB)
-function formatBytes(bytes: number): string {
+function formatBytes(bytes: number, isDir: boolean): string {
+  if (isDir) return '-'
   if (bytes === 0) return '0 B'
   const k = 1024
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -28,7 +37,6 @@ function formatBytes(bytes: number): string {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`
 }
 
-// UNIXタイムスタンプを YYYY/MM/DD HH:mm:ss 形式に変換
 function formatDate(timestamp: number | null): string {
   if (!timestamp) return '-'
   const d = new Date(timestamp)
@@ -77,30 +85,37 @@ function ResultRow({ item, copied, onCopy, onError }: ResultRowProps) {
       onDoubleClick={handleOpen}
       title="ダブルクリックで開く"
     >
-      {/* ファイル名 */}
-      <td className="px-3 py-2 font-mono font-bold text-zinc-900 whitespace-nowrap">{item.name}</td>
-      {/* 親フォルダ */}
-      <td className="px-3 py-2 font-mono text-zinc-500 truncate max-w-xs md:max-w-md" title={item.dir}>
+      <td className="px-3 py-1.5 font-mono text-zinc-900 whitespace-nowrap">
+        <div className="flex items-center gap-1.5">
+          {item.isDir && (
+            <span className="rounded bg-amber-100 px-1 py-0.2 text-[10px] font-bold text-amber-800">DIR</span>
+          )}
+          {item.isSymlink && (
+            <span className="rounded bg-purple-100 px-1 py-0.2 text-[10px] font-bold text-purple-800">LINK</span>
+          )}
+          <span className="font-bold">{item.name}</span>
+        </div>
+      </td>
+      <td className="px-3 py-1.5 font-mono text-zinc-500 truncate max-w-xs md:max-w-md" title={item.dir}>
         {item.dir}
       </td>
-      {/* サイズ */}
-      <td className="px-3 py-2 text-right font-mono text-zinc-600 whitespace-nowrap">{formatBytes(item.size)}</td>
-      {/* 更新日時 */}
-      <td className="px-3 py-2 text-right font-mono text-zinc-600 whitespace-nowrap">{formatDate(item.modified)}</td>
-      {/* 操作ボタン */}
-      <td className="px-3 py-2 text-center whitespace-nowrap">
-        <div className="flex items-center justify-center gap-1.5 opacity-80 group-hover:opacity-100">
+      <td className="px-3 py-1.5 text-right font-mono text-zinc-600 whitespace-nowrap">
+        {formatBytes(item.size, item.isDir)}
+      </td>
+      <td className="px-3 py-1.5 text-right font-mono text-zinc-600 whitespace-nowrap">{formatDate(item.modified)}</td>
+      <td className="px-3 py-1.5 text-center whitespace-nowrap">
+        <div className="flex items-center justify-center gap-1 opacity-80 group-hover:opacity-100">
           <button
             type="button"
             onClick={handleReveal}
-            className="rounded border border-zinc-200 bg-white px-2 py-0.5 text-xs font-medium text-zinc-600 transition hover:border-sky-300 hover:text-sky-700"
+            className="rounded border border-zinc-200 bg-white px-2 py-0.5 text-xs font-medium text-zinc-600 hover:border-sky-300 hover:text-sky-700"
           >
             場所を開く
           </button>
           <button
             type="button"
             onClick={handleCopy}
-            className="min-w-14 rounded border border-zinc-200 bg-white px-2 py-0.5 text-xs font-medium text-zinc-600 transition hover:border-sky-300 hover:text-sky-700"
+            className="min-w-14 rounded border border-zinc-200 bg-white px-2 py-0.5 text-xs font-medium text-zinc-600 hover:border-sky-300 hover:text-sky-700"
           >
             {copied ? '完了!' : 'コピー'}
           </button>
@@ -113,9 +128,17 @@ function ResultRow({ item, copied, onCopy, onError }: ResultRowProps) {
 function App() {
   const [path, setPath] = useState('C:\\')
   const [pattern, setPattern] = useState('')
-  const [extension, setExtension] = useState('') // 追加: 拡張子
+  const [andPattern, setAndPattern] = useState('')
+  const [extension, setExtension] = useState('')
+  const [isGlob, setIsGlob] = useState(false)
+  const [fullPath, setFullPath] = useState(false)
   const [hidden, setHidden] = useState(false)
+  const [noIgnore, setNoIgnore] = useState(false)
+  const [unrestricted, setUnrestricted] = useState(false)
+  const [follow, setFollow] = useState(false)
   const [caseSensitive, setCaseSensitive] = useState(false)
+  const [fileType, setFileType] = useState('all')
+
   const [results, setResults] = useState<SearchResultItem[]>([])
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -131,9 +154,16 @@ function App() {
     const args: SearchArgs = {
       path,
       pattern,
+      andPattern: andPattern.trim() || undefined,
       extension,
+      isGlob,
+      fullPath,
       hidden,
+      noIgnore,
+      unrestricted,
+      follow,
       caseSensitive,
+      fileType,
     }
 
     try {
@@ -167,32 +197,29 @@ function App() {
 
   function handleCopied(filePath: string) {
     setCopiedPath(filePath)
-    if (copyTimer.current) {
-      clearTimeout(copyTimer.current)
-    }
-    copyTimer.current = setTimeout(() => {
-      setCopiedPath(null)
-    }, 1500)
+    if (copyTimer.current) clearTimeout(copyTimer.current)
+    copyTimer.current = setTimeout(() => setCopiedPath(null), 1500)
   }
 
   return (
     <div className="flex h-screen flex-col bg-zinc-50 text-zinc-800">
       <main className="flex min-h-0 flex-1 flex-col gap-2 p-2">
-        <form onSubmit={handleSearch} className="shrink-0 rounded-lg border border-zinc-200 bg-white p-2">
-          <div className="grid gap-2 md:grid-cols-3">
-            <label className="flex flex-col gap-1 md:col-span-1">
-              <span className="text-sm font-medium text-zinc-700">検索ディレクトリ</span>
+        <form onSubmit={handleSearch} className="shrink-0 rounded-lg border border-zinc-200 bg-white p-2.5 shadow-sm">
+          {/* 1段目: ディレクトリ & 検索パターン */}
+          <div className="grid gap-2 md:grid-cols-4">
+            <label className="flex flex-col gap-1 md:col-span-2">
+              <span className="text-xs font-semibold text-zinc-700">検索ディレクトリ</span>
               <div className="flex gap-1.5">
                 <input
                   type="text"
                   value={path}
                   onChange={(e) => setPath(e.currentTarget.value)}
-                  className="min-w-0 flex-1 rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
+                  className="min-w-0 flex-1 rounded border border-zinc-300 px-2.5 py-1 text-sm outline-none focus:border-sky-500"
                 />
                 <button
                   type="button"
                   onClick={handleBrowse}
-                  className="shrink-0 rounded-lg border border-zinc-300 bg-white px-2.5 py-1.5 text-sm font-medium text-zinc-700 transition hover:border-sky-400 hover:bg-sky-50 hover:text-sky-800"
+                  className="shrink-0 rounded border border-zinc-300 bg-zinc-50 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-sky-50"
                 >
                   参照...
                 </button>
@@ -200,88 +227,175 @@ function App() {
             </label>
 
             <label className="flex flex-col gap-1">
-              <span className="text-sm font-medium text-zinc-700">キーワード</span>
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-zinc-700">
+                  {isGlob ? 'Glob パターン (-g)' : '正規表現パターン'}
+                </span>
+                <label className="flex cursor-pointer items-center gap-1 text-[11px] font-normal text-sky-700">
+                  <input
+                    type="checkbox"
+                    checked={isGlob}
+                    onChange={(e) => setIsGlob(e.currentTarget.checked)}
+                    className="size-3 rounded"
+                  />
+                  Globモード
+                </label>
+              </div>
               <input
                 type="text"
                 value={pattern}
                 onChange={(e) => setPattern(e.currentTarget.value)}
-                placeholder="例: config / main / test"
-                className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
+                placeholder={isGlob ? '*.{rs,ts} / test_*' : '^[a-z]+_test|main'}
+                className="rounded border border-zinc-300 px-2.5 py-1 text-sm outline-none focus:border-sky-500"
               />
             </label>
 
-            {/* 追加: 拡張子入力欄 (-e) */}
             <label className="flex flex-col gap-1">
-              <span className="text-sm font-medium text-zinc-700">拡張子 (-e)</span>
+              <span className="text-xs font-semibold text-zinc-700">追加条件 (--and)</span>
               <input
                 type="text"
-                value={extension}
-                onChange={(e) => setExtension(e.currentTarget.value)}
-                placeholder="例: rs / ts / png (ドットなし可)"
-                className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
+                value={andPattern}
+                onChange={(e) => setAndPattern(e.currentTarget.value)}
+                placeholder="必須パターン"
+                className="rounded border border-zinc-300 px-2.5 py-1 text-sm outline-none focus:border-sky-500"
               />
             </label>
           </div>
 
-          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-zinc-100 pt-2">
-            <div className="flex flex-wrap gap-4 text-sm">
-              <label className="inline-flex cursor-pointer items-center gap-1.5 text-zinc-700">
-                <input
-                  type="checkbox"
-                  checked={hidden}
-                  onChange={(e) => setHidden(e.currentTarget.checked)}
-                  className="size-4 rounded border-zinc-300 text-sky-600 focus:ring-sky-500"
-                />
-                隠しファイルを含める (-H)
-              </label>
-              <label className="inline-flex cursor-pointer items-center gap-1.5 text-zinc-700">
+          {/* 2段目: 拡張子 & 種別 & 各種フラグ */}
+          <div className="mt-2.5 grid gap-2 md:grid-cols-4 items-end border-t border-zinc-100 pt-2">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-semibold text-zinc-700">拡張子 (-e)</span>
+              <input
+                type="text"
+                value={extension}
+                onChange={(e) => setExtension(e.currentTarget.value)}
+                placeholder="rs / json (ドット不要)"
+                className="rounded border border-zinc-300 px-2.5 py-1 text-sm outline-none focus:border-sky-500"
+              />
+            </label>
+
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-semibold text-zinc-700">種別 (-t, --type)</span>
+              <select
+                value={fileType}
+                onChange={(e) => setFileType(e.currentTarget.value)}
+                className="rounded border border-zinc-300 bg-white px-2 py-1 text-sm outline-none focus:border-sky-500"
+              >
+                <option value="all">すべて (All)</option>
+                <option value="file">ファイル (File)</option>
+                <option value="directory">ディレクトリ (Directory)</option>
+                <option value="symlink">シンボリックリンク (Symlink)</option>
+              </select>
+            </label>
+
+            {/* チェックボックス群 */}
+            <div className="md:col-span-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-zinc-700">
+              <label className="inline-flex cursor-pointer items-center gap-1">
                 <input
                   type="checkbox"
                   checked={caseSensitive}
                   onChange={(e) => setCaseSensitive(e.currentTarget.checked)}
-                  className="size-4 rounded border-zinc-300 text-sky-600 focus:ring-sky-500"
+                  className="rounded"
                 />
-                大文字小文字を区別 (-s)
+                大文字小文字区別 (-s)
+              </label>
+
+              <label className="inline-flex cursor-pointer items-center gap-1">
+                <input
+                  type="checkbox"
+                  checked={fullPath}
+                  onChange={(e) => setFullPath(e.currentTarget.checked)}
+                  className="rounded"
+                />
+                パス全体で一致 (-p)
+              </label>
+
+              <label className="inline-flex cursor-pointer items-center gap-1">
+                <input
+                  type="checkbox"
+                  checked={hidden}
+                  disabled={unrestricted}
+                  onChange={(e) => setHidden(e.currentTarget.checked)}
+                  className="rounded"
+                />
+                隠しファイル (-H)
+              </label>
+
+              <label className="inline-flex cursor-pointer items-center gap-1">
+                <input
+                  type="checkbox"
+                  checked={noIgnore}
+                  disabled={unrestricted}
+                  onChange={(e) => setNoIgnore(e.currentTarget.checked)}
+                  className="rounded"
+                />
+                無視ファイルも含める (-I)
+              </label>
+
+              <label
+                className="inline-flex cursor-pointer items-center gap-1 font-semibold text-amber-700"
+                title="隠しファイルと無視ファイルの両方を含めます"
+              >
+                <input
+                  type="checkbox"
+                  checked={unrestricted}
+                  onChange={(e) => setUnrestricted(e.currentTarget.checked)}
+                  className="rounded"
+                />
+                全対象 (-u)
+              </label>
+
+              <label className="inline-flex cursor-pointer items-center gap-1">
+                <input
+                  type="checkbox"
+                  checked={follow}
+                  onChange={(e) => setFollow(e.currentTarget.checked)}
+                  className="rounded"
+                />
+                リンク追跡 (-L)
               </label>
             </div>
+          </div>
 
+          <div className="mt-2.5 flex justify-end">
             <button
               type="submit"
               disabled={loading}
-              className="inline-flex min-w-28 items-center justify-center rounded-lg bg-sky-600 px-4 py-1.5 text-sm font-medium text-white transition hover:bg-sky-700 disabled:cursor-not-allowed disabled:bg-sky-400"
+              className="inline-flex min-w-28 items-center justify-center rounded bg-sky-600 px-4 py-1.5 text-xs font-semibold text-white shadow-sm hover:bg-sky-700 disabled:bg-sky-400"
             >
-              {loading ? '検索中...' : '検索'}
+              {loading ? '検索中...' : '検索実行'}
             </button>
           </div>
         </form>
 
         {error && (
-          <div role="alert" className="rounded-lg border border-red-300 bg-red-50 px-2 py-1.5 text-sm text-red-700">
+          <div role="alert" className="rounded border border-red-300 bg-red-50 px-2 py-1.5 text-xs text-red-700">
             {error}
           </div>
         )}
 
-        {/* テーブル形式の検索結果 */}
+        {/* 検索結果テーブル */}
         <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white">
-          <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 px-3 py-2 bg-zinc-50">
-            <h2 className="text-sm font-medium text-zinc-800">検索結果</h2>
+          <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 bg-zinc-50 px-3 py-1.5">
+            <h2 className="text-xs font-semibold text-zinc-800">検索結果</h2>
             <span className="text-xs text-zinc-500">{hasSearched ? `${results.length} 件` : '未検索'}</span>
           </div>
 
           <div className="min-h-0 flex-1 overflow-auto">
             {!hasSearched ? (
-              <p className="px-2 py-6 text-center text-sm text-zinc-400">検索条件を入力して検索してください</p>
+              <p className="px-2 py-6 text-center text-xs text-zinc-400">検索条件を入力して検索してください</p>
             ) : results.length === 0 ? (
-              <p className="px-2 py-6 text-center text-sm text-zinc-400">該当するファイルはありません</p>
+              <p className="px-2 py-6 text-center text-xs text-zinc-400">該当するファイルはありません</p>
             ) : (
               <table className="w-full border-collapse text-left text-xs">
                 <thead className="sticky top-0 z-10 border-b border-zinc-200 bg-zinc-100 text-zinc-600 shadow-sm">
                   <tr>
-                    <th className="px-3 py-2 font-semibold">ファイル名</th>
+                    <th className="px-3 py-2 font-semibold">名前</th>
                     <th className="px-3 py-2 font-semibold">親フォルダ</th>
-                    <th className="w-24 px-3 py-2 text-right font-semibold">サイズ</th>
+                    <th className="w-20 px-3 py-2 text-right font-semibold">サイズ</th>
                     <th className="w-36 px-3 py-2 text-right font-semibold">更新日時</th>
-                    <th className="w-32 px-3 py-2 text-center font-semibold">操作</th>
+                    <th className="w-28 px-3 py-2 text-center font-semibold">操作</th>
                   </tr>
                 </thead>
                 <tbody>
