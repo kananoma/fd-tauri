@@ -377,9 +377,11 @@ function App() {
         <form onSubmit={handleSearch} className="shrink-0 rounded-lg border border-zinc-200 bg-white p-2.5 shadow-sm">
           {/* 1段目: ディレクトリ & 検索パターン */}
           <div className="grid gap-2 md:grid-cols-3">
-            <label className="flex flex-col gap-1 md:col-span-1">
+            <div className="flex flex-col gap-1 md:col-span-1">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-zinc-700">検索ディレクトリ</span>
+                <label htmlFor="search-path" className="text-xs font-semibold text-zinc-700">
+                  検索ディレクトリ
+                </label>
                 <span className="text-[10px] text-zinc-400">フォルダをD&D可</span>
               </div>
               {/* ドラッグ＆ドロップターゲットエリア */}
@@ -405,6 +407,7 @@ function App() {
                 }`}
               >
                 <input
+                  id="search-path"
                   type="text"
                   value={path}
                   onChange={(e) => setPath(e.currentTarget.value)}
@@ -421,18 +424,18 @@ function App() {
                   参照...
                 </button>
               </div>
-            </label>
+            </div>
 
-            <label className="flex flex-col gap-1 md:col-span-2">
+            <div className="flex flex-col gap-1 md:col-span-2">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-zinc-700">
+                <label htmlFor="search-pattern" className="text-xs font-semibold text-zinc-700">
                   {isGlob ? 'Glob パターン (-g)' : '正規表現パターン'}
-                </span>
+                </label>
                 <div className="flex items-center gap-3">
                   <button
                     type="button"
                     onClick={handleAddAndPattern}
-                    className="inline-flex items-center gap-1 text-xs font-medium text-sky-600 hover:text-sky-800"
+                    className="inline-flex items-center gap-1 text-xs font-medium text-sky-600 hover:text-sky-800 cursor-pointer"
                   >
                     ＋ AND条件を追加
                   </button>
@@ -448,13 +451,14 @@ function App() {
                 </div>
               </div>
               <input
+                id="search-pattern"
                 type="text"
                 value={pattern}
                 onChange={(e) => setPattern(e.currentTarget.value)}
                 placeholder={isGlob ? '*.{rs,ts} / test_*' : '^[a-z]+_test|main'}
                 className="rounded border border-zinc-300 px-2.5 py-1 text-sm outline-none focus:border-sky-500"
               />
-            </label>
+            </div>
           </div>
 
           {/* --and 条件の入力欄エリア */}
