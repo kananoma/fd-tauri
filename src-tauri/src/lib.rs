@@ -73,7 +73,6 @@ async fn search_files(args: SearchArgs) -> Result<Vec<SearchResultItem>, String>
 }
 
 fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
-    // 1. パターンマッチャー（基本パターン + 複数の --and パターン）の構築
     let mut matchers = Vec::new();
     if !args.pattern.trim().is_empty() {
         matchers.push(PatternMatcher::new(
@@ -83,7 +82,6 @@ fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
         )?);
     }
 
-    // ★ 複数の --and パターンをすべて登録
     for and_p in &args.and_patterns {
         let trimmed = and_p.trim();
         if !trimmed.is_empty() {
@@ -171,7 +169,6 @@ fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
             file_name.clone()
         };
 
-        // すべての条件（基本パターン + すべての --and 条件）に一致するか検証
         let all_matched = matchers.iter().all(|m| m.is_match(&target_text));
         if !all_matched {
             continue;
@@ -234,12 +231,29 @@ fn open_in_explorer(path: String) -> Result<(), String> {
     }
 }
 
+// ドロップされたパスからディレクトリパスを決定する（フォルダならそのまま、ファイルなら親フォルダ）
+#[tauri::command]
+fn resolve_directory_path(path: String) -> String {
+    let p = std::path::Path::new(&path);
+    if p.is_dir() {
+        path
+    } else if let Some(parent) = p.parent() {
+        parent.to_string_lossy().to_string()
+    } else {
+        path
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![search_files, open_in_explorer])
+        .invoke_handler(tauri::generate_handler![
+            search_files,
+            open_in_explorer,
+            resolve_directory_path
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

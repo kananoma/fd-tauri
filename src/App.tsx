@@ -1,12 +1,13 @@
-import { FormEvent, MouseEvent, useRef, useState } from 'react'
+import { FormEvent, MouseEvent, useEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { openPath } from '@tauri-apps/plugin-opener'
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 
 type SearchArgs = {
   path: string
   pattern: string
-  andPatterns: string[] // ★ 変更: 文字列配列
+  andPatterns: string[]
   extension: string
   isGlob: boolean
   fullPath: boolean
@@ -26,6 +27,26 @@ type SearchResultItem = {
   modified: number | null
   isDir: boolean
   isSymlink: boolean
+}
+
+type ColumnKey = 'type' | 'name' | 'dir' | 'size' | 'modified' | 'actions'
+
+const COLUMN_CONFIG: { key: ColumnKey; label: string; align?: 'left' | 'right' | 'center' }[] = [
+  { key: 'type', label: '種類', align: 'left' },
+  { key: 'name', label: '名前', align: 'left' },
+  { key: 'dir', label: '親フォルダ', align: 'left' },
+  { key: 'size', label: 'サイズ', align: 'right' },
+  { key: 'modified', label: '更新日時', align: 'right' },
+  { key: 'actions', label: '操作', align: 'center' },
+]
+
+const MIN_COLUMN_WIDTHS: Record<ColumnKey, number> = {
+  type: 65,
+  name: 120,
+  dir: 120,
+  size: 70,
+  modified: 120,
+  actions: 110,
 }
 
 function formatBytes(bytes: number, isDir: boolean): string {
@@ -85,25 +106,45 @@ function ResultRow({ item, copied, onCopy, onError }: ResultRowProps) {
       onDoubleClick={handleOpen}
       title="ダブルクリックで開く"
     >
-      <td className="px-3 py-1.5 font-mono text-zinc-900 whitespace-nowrap">
-        <div className="flex items-center gap-1.5">
-          {item.isDir && (
-            <span className="rounded bg-amber-100 px-1 py-0.2 text-[10px] font-bold text-amber-800">DIR</span>
-          )}
-          {item.isSymlink && (
-            <span className="rounded bg-purple-100 px-1 py-0.2 text-[10px] font-bold text-purple-800">LINK</span>
-          )}
-          <span className="font-bold">{item.name}</span>
-        </div>
+      {/* 1. 種類列 */}
+      <td className="px-3 py-1.5 whitespace-nowrap overflow-hidden">
+        {item.isDir ? (
+          <span className="inline-flex items-center gap-1 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-800">
+            📁 フォルダ
+          </span>
+        ) : item.isSymlink ? (
+          <span className="inline-flex items-center gap-1 rounded bg-purple-100 px-1.5 py-0.5 text-[10px] font-bold text-purple-800">
+            🔗 リンク
+          </span>
+        ) : (
+          <span className="inline-flex items-center gap-1 rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700">
+            📄 ファイル
+          </span>
+        )}
       </td>
-      <td className="px-3 py-1.5 font-mono text-zinc-500 truncate max-w-xs md:max-w-md" title={item.dir}>
+
+      {/* 2. 名前列 */}
+      <td className="px-3 py-1.5 font-mono text-zinc-900 truncate" title={item.name}>
+        <span className="font-semibold">{item.name}</span>
+      </td>
+
+      {/* 3. 親フォルダ列 */}
+      <td className="px-3 py-1.5 font-mono text-zinc-500 truncate" title={item.dir}>
         {item.dir}
       </td>
-      <td className="px-3 py-1.5 text-right font-mono text-zinc-600 whitespace-nowrap">
+
+      {/* 4. サイズ列 */}
+      <td className="px-3 py-1.5 text-right font-mono text-zinc-600 whitespace-nowrap overflow-hidden">
         {formatBytes(item.size, item.isDir)}
       </td>
-      <td className="px-3 py-1.5 text-right font-mono text-zinc-600 whitespace-nowrap">{formatDate(item.modified)}</td>
-      <td className="px-3 py-1.5 text-center whitespace-nowrap">
+
+      {/* 5. 更新日時列 */}
+      <td className="px-3 py-1.5 text-right font-mono text-zinc-600 whitespace-nowrap overflow-hidden">
+        {formatDate(item.modified)}
+      </td>
+
+      {/* 6. 操作列 */}
+      <td className="px-3 py-1.5 text-center whitespace-nowrap overflow-hidden">
         <div className="flex items-center justify-center gap-1 opacity-80 group-hover:opacity-100">
           <button
             type="button"
@@ -128,7 +169,7 @@ function ResultRow({ item, copied, onCopy, onError }: ResultRowProps) {
 function App() {
   const [path, setPath] = useState('C:\\')
   const [pattern, setPattern] = useState('')
-  const [andPatterns, setAndPatterns] = useState<string[]>([]) // ★ 複数パターンの state
+  const [andPatterns, setAndPatterns] = useState<string[]>([])
   const [extension, setExtension] = useState('')
   const [isGlob, setIsGlob] = useState(false)
   const [fullPath, setFullPath] = useState(false)
@@ -146,7 +187,117 @@ function App() {
   const [copiedPath, setCopiedPath] = useState<string | null>(null)
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // --and パターンの追加・変更・削除ハンドラ
+  // 列幅の状態管理
+  const [colWidths, setColWidths] = useState<Record<ColumnKey, number>>({
+    type: 95,
+    name: 240,
+    dir: 300,
+    size: 85,
+    modified: 145,
+    actions: 140,
+  })
+
+  // 列リサイズ用の参照
+  const resizingRef = useRef<{
+    colKey: ColumnKey
+    startX: number
+    startWidth: number
+  } | null>(null)
+
+  // フォルダドラッグ＆ドロップ用
+  const dropZoneRef = useRef<HTMLDivElement>(null)
+  const [isDraggingOver, setIsDraggingOver] = useState(false)
+
+  // ディレクトリパスの自動設定（ファイルがドロップされた場合も親フォルダを解決）
+  const applyDroppedPath = async (rawPath: string) => {
+    try {
+      const resolved = await invoke<string>('resolve_directory_path', { path: rawPath })
+      setPath(resolved)
+    } catch {
+      setPath(rawPath)
+    }
+  }
+
+  // Tauri のネイティブウィンドウへのファイルドロップを監視
+  useEffect(() => {
+    let unlistenFn: (() => void) | null = null
+
+    async function initDropListener() {
+      try {
+        const webview = getCurrentWebviewWindow()
+        unlistenFn = await webview.onDragDropEvent((event) => {
+          const payload = event.payload
+
+          const isOverInputArea = (position?: { x: number; y: number }) => {
+            if (!position || !dropZoneRef.current) return false
+            const rect = dropZoneRef.current.getBoundingClientRect()
+            const dpr = window.devicePixelRatio || 1
+            const logicalX = position.x / dpr
+            const logicalY = position.y / dpr
+            return logicalX >= rect.left && logicalX <= rect.right && logicalY >= rect.top && logicalY <= rect.bottom
+          }
+
+          if (payload.type === 'enter' || payload.type === 'over') {
+            setIsDraggingOver(isOverInputArea(payload.position))
+          } else if (payload.type === 'drop') {
+            const inArea = isOverInputArea(payload.position)
+            setIsDraggingOver(false)
+            if (inArea && payload.paths && payload.paths.length > 0) {
+              applyDroppedPath(payload.paths[0])
+            }
+          } else if (payload.type === 'leave') {
+            setIsDraggingOver(false)
+          }
+        })
+      } catch (err) {
+        console.warn('onDragDropEvent listener could not be registered:', err)
+      }
+    }
+
+    initDropListener()
+
+    return () => {
+      if (unlistenFn) unlistenFn()
+    }
+  }, [])
+
+  // 列リサイズの開始ハンドラ
+  function handleResizeStart(colKey: ColumnKey, event: MouseEvent) {
+    event.preventDefault()
+    event.stopPropagation()
+
+    resizingRef.current = {
+      colKey,
+      startX: event.clientX,
+      startWidth: colWidths[colKey],
+    }
+
+    function handleMouseMove(e: globalThis.MouseEvent) {
+      if (!resizingRef.current) return
+      const deltaX = e.clientX - resizingRef.current.startX
+      const targetKey = resizingRef.current.colKey
+      const newWidth = Math.max(MIN_COLUMN_WIDTHS[targetKey], resizingRef.current.startWidth + deltaX)
+
+      setColWidths((prev) => ({
+        ...prev,
+        [targetKey]: newWidth,
+      }))
+    }
+
+    function handleMouseUp() {
+      resizingRef.current = null
+      window.removeEventListener('mousemove', handleMouseMove)
+      window.removeEventListener('mouseup', handleMouseUp)
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    window.addEventListener('mousemove', handleMouseMove)
+    window.addEventListener('mouseup', handleMouseUp)
+  }
+
   function handleAddAndPattern() {
     setAndPatterns((prev) => [...prev, ''])
   }
@@ -218,6 +369,8 @@ function App() {
     copyTimer.current = setTimeout(() => setCopiedPath(null), 1500)
   }
 
+  const totalTableWidth = Object.values(colWidths).reduce((sum, w) => sum + w, 0)
+
   return (
     <div className="flex h-screen flex-col bg-zinc-50 text-zinc-800">
       <main className="flex min-h-0 flex-1 flex-col gap-2 p-2">
@@ -225,13 +378,40 @@ function App() {
           {/* 1段目: ディレクトリ & 検索パターン */}
           <div className="grid gap-2 md:grid-cols-3">
             <label className="flex flex-col gap-1 md:col-span-1">
-              <span className="text-xs font-semibold text-zinc-700">検索ディレクトリ</span>
-              <div className="flex gap-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-zinc-700">検索ディレクトリ</span>
+                <span className="text-[10px] text-zinc-400">フォルダをD&D可</span>
+              </div>
+              {/* ドラッグ＆ドロップターゲットエリア */}
+              <div
+                ref={dropZoneRef}
+                onDragOver={(e) => {
+                  e.preventDefault()
+                  setIsDraggingOver(true)
+                }}
+                onDragLeave={() => setIsDraggingOver(false)}
+                onDrop={(e) => {
+                  e.preventDefault()
+                  setIsDraggingOver(false)
+                  if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                    const file = e.dataTransfer.files[0]
+                    // @ts-expect-error Chromium/WebView2 attaches path
+                    const p = file.path
+                    if (p) applyDroppedPath(p)
+                  }
+                }}
+                className={`flex gap-1.5 rounded transition ${
+                  isDraggingOver ? 'ring-2 ring-sky-500 bg-sky-50/70 p-0.5' : ''
+                }`}
+              >
                 <input
                   type="text"
                   value={path}
                   onChange={(e) => setPath(e.currentTarget.value)}
-                  className="min-w-0 flex-1 rounded border border-zinc-300 px-2.5 py-1 text-sm outline-none focus:border-sky-500"
+                  placeholder={isDraggingOver ? 'ここにフォルダをドロップ！' : 'ディレクトリのパス'}
+                  className={`min-w-0 flex-1 rounded border border-zinc-300 px-2.5 py-1 text-sm outline-none transition focus:border-sky-500 ${
+                    isDraggingOver ? 'border-sky-500 bg-sky-50 text-sky-800 font-medium' : 'bg-white'
+                  }`}
                 />
                 <button
                   type="button"
@@ -277,7 +457,7 @@ function App() {
             </label>
           </div>
 
-          {/* ★ 動的に増える --and 条件の入力欄エリア */}
+          {/* --and 条件の入力欄エリア */}
           {andPatterns.length > 0 && (
             <div className="mt-2 rounded-md bg-zinc-50 p-2 border border-zinc-200">
               <div className="mb-1 text-[11px] font-semibold text-zinc-600">
@@ -338,7 +518,6 @@ function App() {
               </select>
             </label>
 
-            {/* チェックボックス群 */}
             <div className="md:col-span-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-zinc-700">
               <label className="inline-flex cursor-pointer items-center gap-1">
                 <input
@@ -427,7 +606,12 @@ function App() {
         <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white">
           <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 bg-zinc-50 px-3 py-1.5">
             <h2 className="text-xs font-semibold text-zinc-800">検索結果</h2>
-            <span className="text-xs text-zinc-500">{hasSearched ? `${results.length} 件` : '未検索'}</span>
+            <div className="flex items-center gap-3">
+              <span className="text-[11px] text-zinc-400">※ ヘッダー境界線をドラッグで列幅変更</span>
+              <span className="text-xs text-zinc-500 font-medium">
+                {hasSearched ? `${results.length} 件` : '未検索'}
+              </span>
+            </div>
           </div>
 
           <div className="min-h-0 flex-1 overflow-auto">
@@ -436,14 +620,33 @@ function App() {
             ) : results.length === 0 ? (
               <p className="px-2 py-6 text-center text-xs text-zinc-400">該当するファイルはありません</p>
             ) : (
-              <table className="w-full border-collapse text-left text-xs">
+              <table
+                className="table-fixed border-collapse text-left text-xs"
+                style={{ width: '100%', minWidth: `${totalTableWidth}px` }}
+              >
+                <colgroup>
+                  {COLUMN_CONFIG.map((col) => (
+                    <col key={col.key} style={{ width: `${colWidths[col.key]}px` }} />
+                  ))}
+                </colgroup>
                 <thead className="sticky top-0 z-10 border-b border-zinc-200 bg-zinc-100 text-zinc-600 shadow-sm">
                   <tr>
-                    <th className="px-3 py-2 font-semibold">名前</th>
-                    <th className="px-3 py-2 font-semibold">親フォルダ</th>
-                    <th className="w-20 px-3 py-2 text-right font-semibold">サイズ</th>
-                    <th className="w-36 px-3 py-2 text-right font-semibold">更新日時</th>
-                    <th className="w-28 px-3 py-2 text-center font-semibold">操作</th>
+                    {COLUMN_CONFIG.map((col) => (
+                      <th
+                        key={col.key}
+                        className={`relative border-r border-zinc-200 px-3 py-2 font-semibold select-none ${
+                          col.align === 'right' ? 'text-right' : col.align === 'center' ? 'text-center' : 'text-left'
+                        }`}
+                      >
+                        <span className="truncate">{col.label}</span>
+                        {/* カラムリサイズハンドル */}
+                        <div
+                          onMouseDown={(e) => handleResizeStart(col.key, e)}
+                          className="absolute right-0 top-0 bottom-0 w-2 cursor-col-resize hover:bg-sky-400 active:bg-sky-600 transition-colors z-20"
+                          title="ドラッグして列幅を変更"
+                        />
+                      </th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
