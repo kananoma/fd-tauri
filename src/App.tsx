@@ -607,7 +607,6 @@ function App() {
           <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 bg-zinc-50 px-3 py-1.5">
             <h2 className="text-xs font-semibold text-zinc-800">検索結果</h2>
             <div className="flex items-center gap-3">
-              <span className="text-[11px] text-zinc-400">※ ヘッダー境界線をドラッグで列幅変更</span>
               <span className="text-xs text-zinc-500 font-medium">
                 {hasSearched ? `${results.length} 件` : '未検索'}
               </span>
