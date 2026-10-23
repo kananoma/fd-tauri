@@ -8,6 +8,7 @@ type SearchArgs = {
   path: string
   pattern: string
   andPatterns: string[]
+  excludePatterns: string[]
   extension: string
   isGlob: boolean
   fullPath: boolean
@@ -17,6 +18,13 @@ type SearchArgs = {
   follow: boolean
   caseSensitive: boolean
   fileType: string
+  minDepth: number | null
+  maxDepth: number | null
+  minSize: string | null
+  maxSize: string | null
+  changedAfter: number | null
+  changedBefore: number | null
+  emptyOnly: boolean
 }
 
 type SearchResultItem = {
@@ -106,7 +114,6 @@ function ResultRow({ item, copied, onCopy, onError }: ResultRowProps) {
       onDoubleClick={handleOpen}
       title="ダブルクリックで開く"
     >
-      {/* 1. 種類列 */}
       <td className="px-3 py-1.5 whitespace-nowrap overflow-hidden">
         {item.isDir ? (
           <span className="inline-flex items-center gap-1 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-800">
@@ -122,41 +129,31 @@ function ResultRow({ item, copied, onCopy, onError }: ResultRowProps) {
           </span>
         )}
       </td>
-
-      {/* 2. 名前列 */}
       <td className="px-3 py-1.5 font-mono text-zinc-900 truncate" title={item.name}>
         <span className="font-semibold">{item.name}</span>
       </td>
-
-      {/* 3. 親フォルダ列 */}
       <td className="px-3 py-1.5 font-mono text-zinc-500 truncate" title={item.dir}>
         {item.dir}
       </td>
-
-      {/* 4. サイズ列 */}
       <td className="px-3 py-1.5 text-right font-mono text-zinc-600 whitespace-nowrap overflow-hidden">
         {formatBytes(item.size, item.isDir)}
       </td>
-
-      {/* 5. 更新日時列 */}
       <td className="px-3 py-1.5 text-right font-mono text-zinc-600 whitespace-nowrap overflow-hidden">
         {formatDate(item.modified)}
       </td>
-
-      {/* 6. 操作列 */}
       <td className="px-3 py-1.5 text-center whitespace-nowrap overflow-hidden">
         <div className="flex items-center justify-center gap-1 opacity-80 group-hover:opacity-100">
           <button
             type="button"
             onClick={handleReveal}
-            className="rounded border border-zinc-200 bg-white px-2 py-0.5 text-xs font-medium text-zinc-600 hover:border-sky-300 hover:text-sky-700"
+            className="rounded border border-zinc-200 bg-white px-2 py-0.5 text-xs font-medium text-zinc-600 hover:border-sky-300 hover:text-sky-700 cursor-pointer"
           >
             場所を開く
           </button>
           <button
             type="button"
             onClick={handleCopy}
-            className="min-w-14 rounded border border-zinc-200 bg-white px-2 py-0.5 text-xs font-medium text-zinc-600 hover:border-sky-300 hover:text-sky-700"
+            className="min-w-14 rounded border border-zinc-200 bg-white px-2 py-0.5 text-xs font-medium text-zinc-600 hover:border-sky-300 hover:text-sky-700 cursor-pointer"
           >
             {copied ? '完了!' : 'コピー'}
           </button>
@@ -170,6 +167,7 @@ function App() {
   const [path, setPath] = useState('C:\\')
   const [pattern, setPattern] = useState('')
   const [andPatterns, setAndPatterns] = useState<string[]>([])
+  const [excludePatterns, setExcludePatterns] = useState<string[]>([])
   const [extension, setExtension] = useState('')
   const [isGlob, setIsGlob] = useState(false)
   const [fullPath, setFullPath] = useState(false)
@@ -180,6 +178,16 @@ function App() {
   const [caseSensitive, setCaseSensitive] = useState(false)
   const [fileType, setFileType] = useState('all')
 
+  // 新規追加: 深度・サイズ・日時・空フィルタ
+  const [minDepth, setMinDepth] = useState('')
+  const [maxDepth, setMaxDepth] = useState('')
+  const [minSize, setMinSize] = useState('')
+  const [maxSize, setMaxSize] = useState('')
+  const [changedAfter, setChangedAfter] = useState('')
+  const [changedBefore, setChangedBefore] = useState('')
+  const [emptyOnly, setEmptyOnly] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
+
   const [results, setResults] = useState<SearchResultItem[]>([])
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -187,7 +195,6 @@ function App() {
   const [copiedPath, setCopiedPath] = useState<string | null>(null)
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // 列幅の状態管理
   const [colWidths, setColWidths] = useState<Record<ColumnKey, number>>({
     type: 95,
     name: 240,
@@ -197,18 +204,15 @@ function App() {
     actions: 140,
   })
 
-  // 列リサイズ用の参照
   const resizingRef = useRef<{
     colKey: ColumnKey
     startX: number
     startWidth: number
   } | null>(null)
 
-  // フォルダドラッグ＆ドロップ用
   const dropZoneRef = useRef<HTMLDivElement>(null)
   const [isDraggingOver, setIsDraggingOver] = useState(false)
 
-  // ディレクトリパスの自動設定（ファイルがドロップされた場合も親フォルダを解決）
   const applyDroppedPath = async (rawPath: string) => {
     try {
       const resolved = await invoke<string>('resolve_directory_path', { path: rawPath })
@@ -218,7 +222,6 @@ function App() {
     }
   }
 
-  // Tauri のネイティブウィンドウへのファイルドロップを監視
   useEffect(() => {
     let unlistenFn: (() => void) | null = null
 
@@ -261,7 +264,6 @@ function App() {
     }
   }, [])
 
-  // 列リサイズの開始ハンドラ
   function handleResizeStart(colKey: ColumnKey, event: MouseEvent) {
     event.preventDefault()
     event.stopPropagation()
@@ -314,15 +316,43 @@ function App() {
     setAndPatterns((prev) => prev.filter((_, i) => i !== index))
   }
 
+  function handleAddExcludePattern() {
+    setExcludePatterns((prev) => [...prev, ''])
+  }
+
+  function handleUpdateExcludePattern(index: number, value: string) {
+    setExcludePatterns((prev) => {
+      const next = [...prev]
+      next[index] = value
+      return next
+    })
+  }
+
+  function handleRemoveExcludePattern(index: number) {
+    setExcludePatterns((prev) => prev.filter((_, i) => i !== index))
+  }
+
+  function setChangedWithin(hours: number) {
+    const d = new Date(Date.now() - hours * 60 * 60 * 1000)
+    const pad = (n: number) => n.toString().padStart(2, '0')
+    const localIso = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+    setChangedAfter(localIso)
+    setChangedBefore('')
+  }
+
   async function handleSearch(event: FormEvent) {
     event.preventDefault()
     setLoading(true)
     setError(null)
 
+    const parsedMinDepth = minDepth.trim() ? parseInt(minDepth.trim(), 10) : null
+    const parsedMaxDepth = maxDepth.trim() ? parseInt(maxDepth.trim(), 10) : null
+
     const args: SearchArgs = {
       path,
       pattern,
       andPatterns: andPatterns.map((p) => p.trim()).filter((p) => p.length > 0),
+      excludePatterns: excludePatterns.map((p) => p.trim()).filter((p) => p.length > 0),
       extension,
       isGlob,
       fullPath,
@@ -332,6 +362,13 @@ function App() {
       follow,
       caseSensitive,
       fileType,
+      minDepth: isNaN(Number(parsedMinDepth)) ? null : parsedMinDepth,
+      maxDepth: isNaN(Number(parsedMaxDepth)) ? null : parsedMaxDepth,
+      minSize: minSize.trim() || null,
+      maxSize: maxSize.trim() || null,
+      changedAfter: changedAfter ? new Date(changedAfter).getTime() : null,
+      changedBefore: changedBefore ? new Date(changedBefore).getTime() : null,
+      emptyOnly,
     }
 
     try {
@@ -384,7 +421,6 @@ function App() {
                 </label>
                 <span className="text-[10px] text-zinc-400">フォルダをD&D可</span>
               </div>
-              {/* ドラッグ＆ドロップターゲットエリア */}
               <div
                 ref={dropZoneRef}
                 onDragOver={(e) => {
@@ -419,7 +455,7 @@ function App() {
                 <button
                   type="button"
                   onClick={handleBrowse}
-                  className="shrink-0 rounded border border-zinc-300 bg-zinc-50 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-sky-50"
+                  className="shrink-0 rounded border border-zinc-300 bg-zinc-50 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-sky-50 cursor-pointer"
                 >
                   参照...
                 </button>
@@ -431,13 +467,20 @@ function App() {
                 <label htmlFor="search-pattern" className="text-xs font-semibold text-zinc-700">
                   {isGlob ? 'Glob パターン (-g)' : '正規表現パターン'}
                 </label>
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-2">
                   <button
                     type="button"
                     onClick={handleAddAndPattern}
                     className="inline-flex items-center gap-1 text-xs font-medium text-sky-600 hover:text-sky-800 cursor-pointer"
                   >
-                    ＋ AND条件を追加
+                    ＋ AND条件
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleAddExcludePattern}
+                    className="inline-flex items-center gap-1 text-xs font-medium text-rose-600 hover:text-rose-800 cursor-pointer"
+                  >
+                    ＋ 除外条件 (-E)
                   </button>
                   <label className="flex cursor-pointer items-center gap-1 text-[11px] font-normal text-sky-700">
                     <input
@@ -461,7 +504,7 @@ function App() {
             </div>
           </div>
 
-          {/* --and 条件の入力欄エリア */}
+          {/* AND条件の入力欄 */}
           {andPatterns.length > 0 && (
             <div className="mt-2 rounded-md bg-zinc-50 p-2 border border-zinc-200">
               <div className="mb-1 text-[11px] font-semibold text-zinc-600">
@@ -484,7 +527,7 @@ function App() {
                     <button
                       type="button"
                       onClick={() => handleRemoveAndPattern(index)}
-                      className="flex size-4 items-center justify-center rounded-full text-zinc-400 hover:bg-zinc-200 hover:text-red-600 text-xs"
+                      className="flex size-4 items-center justify-center rounded-full text-zinc-400 hover:bg-zinc-200 hover:text-red-600 text-xs cursor-pointer"
                       title="条件を削除"
                     >
                       ✕
@@ -495,22 +538,62 @@ function App() {
             </div>
           )}
 
-          {/* 2段目: 拡張子 & 種別 & 各種フラグ */}
+          {/* 除外パターンの入力欄 */}
+          {excludePatterns.length > 0 && (
+            <div className="mt-2 rounded-md bg-rose-50/50 p-2 border border-rose-200">
+              <div className="mb-1 text-[11px] font-semibold text-rose-700">
+                除外パターン (-E, --exclude) — 一致するパス・フォルダを探索から除外
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {excludePatterns.map((exPat, index) => (
+                  <div
+                    key={index}
+                    className="flex items-center gap-1 rounded border border-rose-300 bg-white px-1.5 py-0.5"
+                  >
+                    <span className="text-[10px] font-bold text-rose-400">除外 #{index + 1}</span>
+                    <input
+                      type="text"
+                      value={exPat}
+                      onChange={(e) => handleUpdateExcludePattern(index, e.currentTarget.value)}
+                      placeholder="node_modules, *.log など"
+                      className="w-36 text-xs outline-none bg-transparent"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveExcludePattern(index)}
+                      className="flex size-4 items-center justify-center rounded-full text-zinc-400 hover:bg-rose-100 hover:text-rose-600 text-xs cursor-pointer"
+                      title="除外条件を削除"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* 2段目: 拡張子 & 種別 & フラグ */}
           <div className="mt-2.5 grid gap-2 md:grid-cols-4 items-end border-t border-zinc-100 pt-2">
-            <label className="flex flex-col gap-1">
-              <span className="text-xs font-semibold text-zinc-700">拡張子 (-e)</span>
+            <div className="flex flex-col gap-1">
+              <label htmlFor="ext-input" className="text-xs font-semibold text-zinc-700">
+                拡張子 (-e)
+              </label>
               <input
+                id="ext-input"
                 type="text"
                 value={extension}
                 onChange={(e) => setExtension(e.currentTarget.value)}
                 placeholder="rs / json (ドット不要)"
                 className="rounded border border-zinc-300 px-2.5 py-1 text-sm outline-none focus:border-sky-500"
               />
-            </label>
+            </div>
 
-            <label className="flex flex-col gap-1">
-              <span className="text-xs font-semibold text-zinc-700">種別 (-t, --type)</span>
+            <div className="flex flex-col gap-1">
+              <label htmlFor="file-type" className="text-xs font-semibold text-zinc-700">
+                種別 (-t, --type)
+              </label>
               <select
+                id="file-type"
                 value={fileType}
                 onChange={(e) => setFileType(e.currentTarget.value)}
                 className="rounded border border-zinc-300 bg-white px-2 py-1 text-sm outline-none focus:border-sky-500"
@@ -520,7 +603,7 @@ function App() {
                 <option value="directory">ディレクトリ (Directory)</option>
                 <option value="symlink">シンボリックリンク (Symlink)</option>
               </select>
-            </label>
+            </div>
 
             <div className="md:col-span-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-zinc-700">
               <label className="inline-flex cursor-pointer items-center gap-1">
@@ -587,18 +670,146 @@ function App() {
                 />
                 リンク追跡 (-L)
               </label>
+
+              {/* 空ファイル/空フォルダ絞り込み */}
+              <label
+                className="inline-flex cursor-pointer items-center gap-1 font-semibold text-emerald-700"
+                title="サイズ0のファイル、または中身が空のディレクトリのみを対象にします"
+              >
+                <input
+                  type="checkbox"
+                  checked={emptyOnly}
+                  onChange={(e) => setEmptyOnly(e.currentTarget.checked)}
+                  className="rounded"
+                />
+                空のみ (--empty)
+              </label>
             </div>
           </div>
 
-          <div className="mt-2.5 flex justify-end">
+          {/* 詳細フィルター開閉トグルボタン */}
+          <div className="mt-2.5 flex items-center justify-between border-t border-zinc-100 pt-2">
+            <button
+              type="button"
+              onClick={() => setShowAdvanced((prev) => !prev)}
+              className="inline-flex items-center gap-1.5 text-xs font-semibold text-sky-700 hover:text-sky-900 cursor-pointer"
+            >
+              <span>{showAdvanced ? '▼' : '▶'}</span>
+              <span>詳細フィルター（深度・サイズ・更新日時）</span>
+              {(minDepth || maxDepth || minSize || maxSize || changedAfter || changedBefore) && (
+                <span className="rounded-full bg-sky-100 px-1.5 py-0.2 text-[10px] text-sky-800 font-bold">適用中</span>
+              )}
+            </button>
+
             <button
               type="submit"
               disabled={loading}
-              className="inline-flex min-w-28 items-center justify-center rounded bg-sky-600 px-4 py-1.5 text-xs font-semibold text-white shadow-sm hover:bg-sky-700 disabled:bg-sky-400"
+              className="inline-flex min-w-28 items-center justify-center rounded bg-sky-600 px-4 py-1.5 text-xs font-semibold text-white shadow-sm hover:bg-sky-700 disabled:bg-sky-400 cursor-pointer"
             >
               {loading ? '検索中...' : '検索実行'}
             </button>
           </div>
+
+          {/* 詳細フィルター展開エリア */}
+          {showAdvanced && (
+            <div className="mt-2.5 grid gap-3 rounded-md border border-zinc-200 bg-zinc-50 p-2.5 text-xs md:grid-cols-3">
+              {/* 1. 深度指定 */}
+              <div className="flex flex-col gap-1">
+                <span className="font-semibold text-zinc-700">階層深度 (--min-depth / -d)</span>
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="number"
+                    min="0"
+                    value={minDepth}
+                    onChange={(e) => setMinDepth(e.currentTarget.value)}
+                    placeholder="最小階層 (未指定可)"
+                    className="w-full rounded border border-zinc-300 bg-white px-2 py-1 outline-none focus:border-sky-500"
+                  />
+                  <span className="text-zinc-400">〜</span>
+                  <input
+                    type="number"
+                    min="0"
+                    value={maxDepth}
+                    onChange={(e) => setMaxDepth(e.currentTarget.value)}
+                    placeholder="最大階層 (未指定可)"
+                    className="w-full rounded border border-zinc-300 bg-white px-2 py-1 outline-none focus:border-sky-500"
+                  />
+                </div>
+              </div>
+
+              {/* 2. サイズ指定 */}
+              <div className="flex flex-col gap-1">
+                <span className="font-semibold text-zinc-700">ファイルサイズ (-S, --size)</span>
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="text"
+                    value={minSize}
+                    onChange={(e) => setMinSize(e.currentTarget.value)}
+                    placeholder="最小 (例: 10KB, 1MB)"
+                    className="w-full rounded border border-zinc-300 bg-white px-2 py-1 outline-none focus:border-sky-500"
+                  />
+                  <span className="text-zinc-400">〜</span>
+                  <input
+                    type="text"
+                    value={maxSize}
+                    onChange={(e) => setMaxSize(e.currentTarget.value)}
+                    placeholder="最大 (例: 100MB, 2GB)"
+                    className="w-full rounded border border-zinc-300 bg-white px-2 py-1 outline-none focus:border-sky-500"
+                  />
+                </div>
+              </div>
+
+              {/* 3. 更新日時指定 */}
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-zinc-700">更新日時 (--changed-within/before)</span>
+                  <div className="flex gap-1 text-[10px]">
+                    <button
+                      type="button"
+                      onClick={() => setChangedWithin(24)}
+                      className="rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-zinc-600 hover:bg-sky-50 cursor-pointer"
+                    >
+                      24時間以内
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setChangedWithin(24 * 7)}
+                      className="rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-zinc-600 hover:bg-sky-50 cursor-pointer"
+                    >
+                      7日以内
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setChangedAfter('')
+                        setChangedBefore('')
+                      }}
+                      className="rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-zinc-500 hover:text-red-600 cursor-pointer"
+                    >
+                      解除
+                    </button>
+                  </div>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="datetime-local"
+                    value={changedAfter}
+                    onChange={(e) => setChangedAfter(e.currentTarget.value)}
+                    className="w-full rounded border border-zinc-300 bg-white px-2 py-1 outline-none focus:border-sky-500"
+                    title="これ以降に更新されたもの"
+                  />
+                  <span className="text-zinc-400">〜</span>
+                  <input
+                    type="datetime-local"
+                    value={changedBefore}
+                    onChange={(e) => setChangedBefore(e.currentTarget.value)}
+                    className="w-full rounded border border-zinc-300 bg-white px-2 py-1 outline-none focus:border-sky-500"
+                    title="これ以前に更新されたもの"
+                  />
+                </div>
+              </div>
+            </div>
+          )}
         </form>
 
         {error && (
@@ -642,7 +853,6 @@ function App() {
                         }`}
                       >
                         <span className="truncate">{col.label}</span>
-                        {/* カラムリサイズハンドル */}
                         <div
                           onMouseDown={(e) => handleResizeStart(col.key, e)}
                           className="absolute right-0 top-0 bottom-0 w-2 cursor-col-resize hover:bg-sky-400 active:bg-sky-600 transition-colors z-20"

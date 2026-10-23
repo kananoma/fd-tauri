@@ -1,4 +1,5 @@
 use globset::{GlobBuilder, GlobMatcher};
+use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,7 @@ pub struct SearchArgs {
     path: String,
     pattern: String,
     and_patterns: Vec<String>,
+    exclude_patterns: Vec<String>,
     extension: Option<String>,
     is_glob: bool,
     full_path: bool,
@@ -20,6 +22,13 @@ pub struct SearchArgs {
     follow: bool,
     case_sensitive: bool,
     file_type: String,
+    min_depth: Option<usize>,
+    max_depth: Option<usize>,
+    min_size: Option<String>,
+    max_size: Option<String>,
+    changed_after: Option<u64>,
+    changed_before: Option<u64>,
+    empty_only: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,6 +74,43 @@ impl PatternMatcher {
     }
 }
 
+// 人間が入力しやすいサイズ文字列 (例: "10MB", "500kb", "1.5GB", "1024") をバイト数へ変換
+fn parse_size_str(s: &str) -> Result<u64, String> {
+    let s = s.trim().to_uppercase();
+    if s.is_empty() {
+        return Err("サイズ指定が空です".to_string());
+    }
+
+    let (num_part, unit_part) = if let Some(idx) = s.find(|c: char| c.is_alphabetic()) {
+        (&s[..idx], &s[idx..])
+    } else {
+        (s.as_str(), "B")
+    };
+
+    let num: f64 = num_part
+        .trim()
+        .parse()
+        .map_err(|_| format!("サイズ数値 '{num_part}' を解析できません"))?;
+    if num < 0.0 {
+        return Err("サイズには0以上の数値を指定してください".to_string());
+    }
+
+    let multiplier = match unit_part.trim() {
+        "B" | "" => 1.0,
+        "K" | "KB" | "KIB" => 1024.0,
+        "M" | "MB" | "MIB" => 1024.0 * 1024.0,
+        "G" | "GB" | "GIB" => 1024.0 * 1024.0 * 1024.0,
+        "T" | "TB" | "TIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        other => {
+            return Err(format!(
+                "未対応の単位 '{other}' です (B, KB, MB, GB, TB が利用可能)"
+            ))
+        }
+    };
+
+    Ok((num * multiplier).round() as u64)
+}
+
 #[tauri::command]
 async fn search_files(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
     tokio::task::spawn_blocking(move || execute_search(args))
@@ -99,6 +145,22 @@ fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
         .map(|e| e.trim().trim_start_matches('.').to_string())
         .filter(|e| !e.is_empty());
 
+    let min_size_bytes = args
+        .min_size
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_size_str)
+        .transpose()?;
+
+    let max_size_bytes = args
+        .max_size
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_size_str)
+        .transpose()?;
+
     let include_hidden = args.hidden || args.unrestricted;
     let ignore_filters = !(args.no_ignore || args.unrestricted);
 
@@ -111,6 +173,37 @@ fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
         .git_exclude(ignore_filters)
         .follow_links(args.follow)
         .parents(ignore_filters);
+
+    // 1. 検索深度の設定
+    if let Some(min_d) = args.min_depth {
+        builder.min_depth(Some(min_d));
+    }
+    if let Some(max_d) = args.max_depth {
+        builder.max_depth(Some(max_d));
+    }
+
+    // 2. 除外パターンの設定 (--exclude / -E)
+    if !args.exclude_patterns.is_empty() {
+        let mut ov_builder = OverrideBuilder::new(&args.path);
+        let _ = ov_builder.case_insensitive(!args.case_sensitive);
+        for pat in &args.exclude_patterns {
+            let trimmed = pat.trim();
+            if !trimmed.is_empty() {
+                let rule = if trimmed.starts_with('!') {
+                    trimmed.to_string()
+                } else {
+                    format!("!{trimmed}")
+                };
+                ov_builder
+                    .add(&rule)
+                    .map_err(|e| format!("無効な除外パターン '{trimmed}' です: {e}"))?;
+            }
+        }
+        let ov = ov_builder
+            .build()
+            .map_err(|e| format!("除外パターンの構築に失敗しました: {e}"))?;
+        builder.overrides(ov);
+    }
 
     let mut results = Vec::new();
 
@@ -187,6 +280,51 @@ fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
             Err(_) => (0, None),
         };
 
+        // 3. サイズによる絞り込み (--size)
+        if min_size_bytes.is_some() || max_size_bytes.is_some() {
+            if is_dir {
+                continue; // フォルダはサイズ判定から除外
+            }
+            if let Some(min_s) = min_size_bytes {
+                if size < min_s {
+                    continue;
+                }
+            }
+            if let Some(max_s) = max_size_bytes {
+                if size > max_s {
+                    continue;
+                }
+            }
+        }
+
+        // 4. 更新日時による絞り込み (--changed-within / --changed-before)
+        if let Some(after) = args.changed_after {
+            match modified {
+                Some(m) if m >= after => {}
+                _ => continue,
+            }
+        }
+        if let Some(before) = args.changed_before {
+            match modified {
+                Some(m) if m <= before => {}
+                _ => continue,
+            }
+        }
+
+        // 5. 空のファイル・ディレクトリ絞り込み (--empty)
+        if args.empty_only {
+            let is_empty = if is_dir {
+                std::fs::read_dir(path)
+                    .map(|mut r| r.next().is_none())
+                    .unwrap_or(false)
+            } else {
+                size == 0
+            };
+            if !is_empty {
+                continue;
+            }
+        }
+
         let path_buf = PathBuf::from(path);
         let dir = path_buf
             .parent()
@@ -231,7 +369,6 @@ fn open_in_explorer(path: String) -> Result<(), String> {
     }
 }
 
-// ドロップされたパスからディレクトリパスを決定する（フォルダならそのまま、ファイルなら親フォルダ）
 #[tauri::command]
 fn resolve_directory_path(path: String) -> String {
     let p = std::path::Path::new(&path);
