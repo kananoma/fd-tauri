@@ -3,8 +3,12 @@ use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
+use tauri::{AppHandle, Emitter, State};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,9 +33,10 @@ pub struct SearchArgs {
     changed_after: Option<u64>,
     changed_before: Option<u64>,
     empty_only: bool,
+    limit: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResultItem {
     pub path: String,
@@ -41,6 +46,25 @@ pub struct SearchResultItem {
     pub modified: Option<u64>,
     pub is_dir: bool,
     pub is_symlink: bool,
+}
+
+#[derive(Default)]
+struct SearchRegistry(Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>);
+
+#[derive(Clone, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum SearchEvent {
+    Results {
+        items: Vec<SearchResultItem>,
+    },
+    Complete {
+        cancelled: bool,
+        limit_reached: bool,
+    },
 }
 
 enum PatternMatcher {
@@ -112,13 +136,49 @@ fn parse_size_str(s: &str) -> Result<u64, String> {
 }
 
 #[tauri::command]
-async fn search_files(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
-    tokio::task::spawn_blocking(move || execute_search(args))
-        .await
-        .map_err(|e| format!("検索タスクの実行に失敗しました: {e}"))?
+async fn search_files(
+    app: AppHandle,
+    registry: State<'_, SearchRegistry>,
+    search_id: String,
+    args: SearchArgs,
+) -> Result<(), String> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    registry
+        .0
+        .lock()
+        .map_err(|e| format!("検索状態をロックできません: {e}"))?
+        .insert(search_id.clone(), Arc::clone(&cancelled));
+
+    let task_registry = Arc::clone(&registry.inner().0);
+    tokio::task::spawn_blocking(move || {
+        let result = execute_search(app, search_id.clone(), args, cancelled);
+        if let Ok(mut searches) = task_registry.lock() {
+            searches.remove(&search_id);
+        }
+        result
+    })
+    .await
+    .map_err(|e| format!("検索タスクの実行に失敗しました: {e}"))?
 }
 
-fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
+#[tauri::command]
+fn cancel_search(registry: State<'_, SearchRegistry>, search_id: String) -> Result<(), String> {
+    let searches = registry
+        .0
+        .lock()
+        .map_err(|e| format!("検索状態をロックできません: {e}"))?;
+    if let Some(cancelled) = searches.get(&search_id) {
+        cancelled.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+fn execute_search(
+    app: AppHandle,
+    search_id: String,
+    args: SearchArgs,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(), String> {
     let mut matchers = Vec::new();
     if !args.pattern.trim().is_empty() {
         matchers.push(PatternMatcher::new(
@@ -205,9 +265,16 @@ fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
         builder.overrides(ov);
     }
 
-    let mut results = Vec::new();
+    let limit = args.limit;
+    let mut batch = Vec::with_capacity(64);
+    let mut result_count = 0;
+    let mut limit_reached = false;
 
     for entry_result in builder.build() {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+
         let entry = match entry_result {
             Ok(e) => e,
             Err(_) => continue,
@@ -331,7 +398,14 @@ fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        results.push(SearchResultItem {
+        if let Some(limit) = limit {
+            if result_count >= limit {
+                limit_reached = true;
+                break;
+            }
+        }
+
+        batch.push(SearchResultItem {
             path: path.to_string_lossy().to_string(),
             name: file_name.to_string(),
             dir,
@@ -340,9 +414,36 @@ fn execute_search(args: SearchArgs) -> Result<Vec<SearchResultItem>, String> {
             is_dir,
             is_symlink,
         });
+
+        result_count += 1;
+        if batch.len() >= 64 {
+            app.emit(
+                &format!("search-{search_id}"),
+                SearchEvent::Results {
+                    items: std::mem::take(&mut batch),
+                },
+            )
+            .map_err(|e| format!("検索結果を通知できません: {e}"))?;
+            batch = Vec::with_capacity(64);
+        }
     }
 
-    Ok(results)
+    if !batch.is_empty() {
+        app.emit(
+            &format!("search-{search_id}"),
+            SearchEvent::Results { items: batch },
+        )
+        .map_err(|e| format!("検索結果を通知できません: {e}"))?;
+    }
+    app.emit(
+        &format!("search-{search_id}"),
+        SearchEvent::Complete {
+            cancelled: cancelled.load(Ordering::Relaxed),
+            limit_reached,
+        },
+    )
+    .map_err(|e| format!("検索完了を通知できません: {e}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -384,10 +485,12 @@ fn resolve_directory_path(path: String) -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(SearchRegistry::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             search_files,
+            cancel_search,
             open_in_explorer,
             resolve_directory_path
         ])

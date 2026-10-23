@@ -3,6 +3,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { openPath } from '@tauri-apps/plugin-opener'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
+import { listen } from '@tauri-apps/api/event'
+import { useVirtualizer } from '@tanstack/react-virtual'
 
 type SearchArgs = {
   path: string
@@ -25,6 +27,7 @@ type SearchArgs = {
   changedAfter: number | null
   changedBefore: number | null
   emptyOnly: boolean
+  limit: number | null
 }
 
 type SearchResultItem = {
@@ -36,6 +39,10 @@ type SearchResultItem = {
   isDir: boolean
   isSymlink: boolean
 }
+
+type SearchEvent =
+  | { type: 'results'; items: SearchResultItem[] }
+  | { type: 'complete'; cancelled: boolean; limitReached: boolean }
 
 type ColumnKey = 'type' | 'name' | 'dir' | 'size' | 'modified' | 'actions'
 
@@ -110,7 +117,7 @@ function ResultRow({ item, copied, onCopy, onError }: ResultRowProps) {
 
   return (
     <tr
-      className="group cursor-pointer border-b border-zinc-100 hover:bg-sky-50 transition"
+      className="group h-9 cursor-pointer border-b border-zinc-100 hover:bg-sky-50 transition"
       onDoubleClick={handleOpen}
       title="ダブルクリックで開く"
     >
@@ -191,6 +198,8 @@ function App() {
   const [results, setResults] = useState<SearchResultItem[]>([])
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const [resultLimit, setResultLimit] = useState('')
+  const [searchInfo, setSearchInfo] = useState<string | null>(null)
   const [hasSearched, setHasSearched] = useState(false)
   const [copiedPath, setCopiedPath] = useState<string | null>(null)
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -211,7 +220,15 @@ function App() {
   } | null>(null)
 
   const dropZoneRef = useRef<HTMLDivElement>(null)
+  const resultsScrollRef = useRef<HTMLDivElement>(null)
+  const activeSearchId = useRef<string | null>(null)
   const [isDraggingOver, setIsDraggingOver] = useState(false)
+  const rowVirtualizer = useVirtualizer({
+    count: results.length,
+    getScrollElement: () => resultsScrollRef.current,
+    estimateSize: () => 36,
+    overscan: 10,
+  })
 
   const applyDroppedPath = async (rawPath: string) => {
     try {
@@ -342,8 +359,19 @@ function App() {
 
   async function handleSearch(event: FormEvent) {
     event.preventDefault()
+    const trimmedLimit = resultLimit.trim()
+    const parsedLimit = trimmedLimit ? Number(trimmedLimit) : null
+    if (trimmedLimit && (!Number.isSafeInteger(parsedLimit) || parsedLimit! < 1)) {
+      setError('上限は1以上の整数、または空欄で指定してください')
+      return
+    }
+
+    const searchId = crypto.randomUUID()
+    activeSearchId.current = searchId
     setLoading(true)
     setError(null)
+    setSearchInfo(null)
+    setResults([])
 
     const parsedMinDepth = minDepth.trim() ? parseInt(minDepth.trim(), 10) : null
     const parsedMaxDepth = maxDepth.trim() ? parseInt(maxDepth.trim(), 10) : null
@@ -369,18 +397,47 @@ function App() {
       changedAfter: changedAfter ? new Date(changedAfter).getTime() : null,
       changedBefore: changedBefore ? new Date(changedBefore).getTime() : null,
       emptyOnly,
+      limit: parsedLimit,
     }
 
+    let resolveCompletion: (event: Extract<SearchEvent, { type: 'complete' }>) => void = () => {}
+    const completion = new Promise<Extract<SearchEvent, { type: 'complete' }>>((resolve) => {
+      resolveCompletion = resolve
+    })
+    let unlisten: (() => void) | undefined
     try {
-      const found = await invoke<SearchResultItem[]>('search_files', { args })
-      setResults(found)
+      unlisten = await listen<SearchEvent>(`search-${searchId}`, (event) => {
+        if (event.payload.type === 'results') {
+          const items = event.payload.items
+          setResults((current) => current.concat(items))
+        } else {
+          resolveCompletion(event.payload)
+        }
+      })
+      await invoke('search_files', { searchId, args })
+      const summary = await completion
+      if (summary.cancelled) setSearchInfo('検索を中断しました')
+      else if (summary.limitReached && parsedLimit !== null) {
+        setSearchInfo(`上限 ${parsedLimit.toLocaleString()} 件に達しました`)
+      }
       setHasSearched(true)
     } catch (e) {
       setResults([])
       setHasSearched(true)
       setError(typeof e === 'string' ? e : String(e))
     } finally {
+      unlisten?.()
+      if (activeSearchId.current === searchId) activeSearchId.current = null
       setLoading(false)
+    }
+  }
+
+  async function handleCancelSearch() {
+    if (!activeSearchId.current) return
+    try {
+      await invoke('cancel_search', { searchId: activeSearchId.current })
+    } catch (e) {
+      setError(typeof e === 'string' ? e : String(e))
     }
   }
 
@@ -407,6 +464,7 @@ function App() {
   }
 
   const totalTableWidth = Object.values(colWidths).reduce((sum, w) => sum + w, 0)
+  const virtualRows = rowVirtualizer.getVirtualItems()
 
   return (
     <div className="flex h-screen flex-col bg-zinc-50 text-zinc-800">
@@ -701,13 +759,39 @@ function App() {
               )}
             </button>
 
-            <button
-              type="submit"
-              disabled={loading}
-              className="inline-flex min-w-28 items-center justify-center rounded bg-sky-600 px-4 py-1.5 text-xs font-semibold text-white shadow-sm hover:bg-sky-700 disabled:bg-sky-400 cursor-pointer"
-            >
-              {loading ? '検索中...' : '検索実行'}
-            </button>
+            <div className="flex items-center gap-2">
+              <label className="flex items-center gap-1 text-xs text-zinc-600">
+                上限
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={resultLimit}
+                  onChange={(e) => setResultLimit(e.currentTarget.value)}
+                  placeholder="なし"
+                  disabled={loading}
+                  className="w-24 rounded border border-zinc-300 bg-white px-1.5 py-1 text-xs"
+                  aria-label="検索結果の件数上限。空欄で上限なし"
+                />
+                <span className="text-[10px] text-zinc-400">空欄=なし</span>
+              </label>
+              {loading && (
+                <button
+                  type="button"
+                  onClick={handleCancelSearch}
+                  className="inline-flex min-w-16 items-center justify-center rounded border border-rose-300 bg-white px-3 py-1.5 text-xs font-semibold text-rose-700 hover:bg-rose-50 cursor-pointer"
+                >
+                  中断
+                </button>
+              )}
+              <button
+                type="submit"
+                disabled={loading}
+                className="inline-flex min-w-28 items-center justify-center rounded bg-sky-600 px-4 py-1.5 text-xs font-semibold text-white shadow-sm hover:bg-sky-700 disabled:bg-sky-400 cursor-pointer"
+              >
+                {loading ? '検索中...' : '検索実行'}
+              </button>
+            </div>
           </div>
 
           {/* 詳細フィルター展開エリア */}
@@ -823,14 +907,18 @@ function App() {
             <h2 className="text-xs font-semibold text-zinc-800">検索結果</h2>
             <div className="flex items-center gap-3">
               <span className="text-xs text-zinc-500 font-medium">
-                {hasSearched ? `${results.length} 件` : '未検索'}
+                {loading ? '検索中 ' : ''}
+                {hasSearched || loading ? `${results.length.toLocaleString()} 件` : '未検索'}
+                {searchInfo ? ` · ${searchInfo}` : ''}
               </span>
             </div>
           </div>
 
-          <div className="min-h-0 flex-1 overflow-auto">
+          <div ref={resultsScrollRef} className="min-h-0 flex-1 overflow-auto">
             {!hasSearched ? (
               <p className="px-2 py-6 text-center text-xs text-zinc-400">検索条件を入力して検索してください</p>
+            ) : results.length === 0 && loading ? (
+              <p className="px-2 py-6 text-center text-xs text-zinc-400">検索中...</p>
             ) : results.length === 0 ? (
               <p className="px-2 py-6 text-center text-xs text-zinc-400">該当するファイルはありません</p>
             ) : (
@@ -863,15 +951,38 @@ function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {results.map((item) => (
-                    <ResultRow
-                      key={item.path}
-                      item={item}
-                      copied={copiedPath === item.path}
-                      onCopy={handleCopied}
-                      onError={setError}
-                    />
-                  ))}
+                  {virtualRows.length > 0 && (
+                    <tr aria-hidden="true">
+                      <td
+                        colSpan={COLUMN_CONFIG.length}
+                        style={{ height: virtualRows[0].start, padding: 0, border: 0 }}
+                      />
+                    </tr>
+                  )}
+                  {virtualRows.map((virtualRow) => {
+                    const item = results[virtualRow.index]
+                    return (
+                      <ResultRow
+                        key={item.path}
+                        item={item}
+                        copied={copiedPath === item.path}
+                        onCopy={handleCopied}
+                        onError={setError}
+                      />
+                    )
+                  })}
+                  {virtualRows.length > 0 && (
+                    <tr aria-hidden="true">
+                      <td
+                        colSpan={COLUMN_CONFIG.length}
+                        style={{
+                          height: rowVirtualizer.getTotalSize() - virtualRows[virtualRows.length - 1].end,
+                          padding: 0,
+                          border: 0,
+                        }}
+                      />
+                    </tr>
+                  )}
                 </tbody>
               </table>
             )}
